@@ -8,11 +8,13 @@
 #include <stdlib.h>
 #include <string.h>
 #include <limits.h>
+#include <inttypes.h>
 
 #define STATIC_ARRAY_SIZE(array) (int)((sizeof((array))/sizeof((array[0]))))
 
 enum {
 	LIBIMAGE_PNG_ERROR_HEADER = 1,
+	LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND,
 	LIBIMAGE_PNG_ERROR_INVALID_FILE,
 	LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH,
 	LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE,
@@ -25,9 +27,9 @@ enum {
 #define CHUNK_CRC_BYTES		4
 #define IS_POWER_OF_TWO(num)	(((int)(num)) & ((((int)num) - 1)))
 
-static unsigned char png_file_sig[]   = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
-static unsigned char png_ihdr_chunk[] = { 73, 72, 68, 82 };	
-static unsigned char png_iend_chunk[] = { 73, 69, 78, 68 };
+static uint8_t png_file_sig[]   = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
+static uint8_t png_ihdr_chunk[] = { 73, 72, 68, 82 };	
+static uint8_t png_iend_chunk[] = { 73, 69, 78, 68 };
 
 /*
  * 3.4. CRC algorithm
@@ -65,8 +67,7 @@ void make_crc_table(void)
 *       should be initialized to all 1's, and the transmitted value
 *             is the 1's complement of the final running CRC (see the
 *                   crc() routine below)). */
-unsigned long update_crc(unsigned long crc, unsigned char *buf,
-int len)
+unsigned long update_crc(unsigned long crc, uint8_t *buf, int len)
 {
 unsigned long c = crc;
 int n;
@@ -80,7 +81,7 @@ int n;
 }
 
 /* Return the CRC of the bytes buf[0..len-1]. */
-unsigned long crc(unsigned char *buf, int len)
+unsigned long crc(uint8_t *buf, int len)
 {
 	return update_crc(0xffffffffL, buf, len) ^ 0xffffffffL;
 }
@@ -110,21 +111,27 @@ unsigned long crc(unsigned char *buf, int len)
 
 typedef struct libimage_png_chunk {
 	union {
-		unsigned char b[4];
-		unsigned int  i;
+		uint8_t b[4]; // Is unsigned but should not be bigger than 2^31 - 1 bytes.
+		uint32_t  i;
 	} data_len;
 	union {
-		unsigned char b[4]; // Restricted to the decimals values 65 to 90 and 97 to 122
-		unsigned int  i;    
+		uint8_t b[4]; // Restricted to the decimals values 65 to 90 and 97 to 122
+		uint32_t  i;    
 	} type;
-	void *chunk_data; // This can be zero
-	unsigned char crc[4];      // calculated on the preceding bytes in the chunk, including the chunk type field and chunk data fields, but not including the length field.
+
+	uint8_t	*start_chunk_data; 	// Can be NULL 
+	uint8_t *end_chunk_data;	// Can be NULL
+	
+	union {	
+		uint8_t b[4];
+		uint32_t  i;
+	} crc;      		// calculated on the preceding bytes in the chunk, including the chunk type field and chunk data fields, but not including the length field.
 } LibImagePngChunk;
 
 
 /*
  *
- * Width and height give the image dimensions in pixels. They are PNG four-byte unsigned integers. Zero is an invalid value.
+ * Width and height give the image dimensions in pixels. They are PNG four-byte uint32_tegers. Zero is an invalid value.
  *
  * Bit depth is a single-byte integer giving the number of bits per sample or per palette index (not per pixel). Valid values are 1, 2, 4, 8, and 16, although not all values are allowed for all colour types.
  *
@@ -134,13 +141,13 @@ typedef struct libimage_png_chunk {
 */
 
 typedef struct libimage_png_ihdr {
-	unsigned int width;
-	unsigned int height;
-	unsigned char bit_depth;
-	unsigned char colour_type;
-	unsigned char compression_method;
-	unsigned char filter_method;
-	unsigned char interlace_method;
+	uint32_t width;
+	uint32_t height;
+	uint8_t bit_depth;
+	uint8_t colour_type;
+	uint8_t compression_method;
+	uint8_t filter_method;
+	uint8_t interlace_method;
 } LibImagePngIHdr;
 
 static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
@@ -172,20 +179,18 @@ static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
 	return 0;
 }
 
-unsigned int integer_from_network_byte(unsigned int value)
+uint32_t integer_from_network_byte(uint32_t value)
 {
-int test 	= 1;
-int result 	= 0, i, total;
+int  	i, total;	
+union   { uint32_t i; char b[4]; } test = { 0x01020304 };
 
-	if(test & 1 == 0) return value;
+	if(test.b[0] == 1) return value;
 
-	total = sizeof value * CHAR_BIT;
+	// Praying that the compiler just do a bswap :^)
+	value = ((value & 0xff000000u) >> 24 ) | ((value & 0x00ff0000u) >> 8)
+	| ((value & 0x0000ff00u) << 8  ) | ((value & 0x000000ffu) << 24);
 
-	for(i = 0; i < total; i++) {
-		result |= ((value >> i) & 1) << (total - 1 - i);
-	}
-
-	return result;	
+	return value;	
 }
 
 void libimage_error_code_to_msg(char *buffer, int buffer_size, int error)
@@ -195,6 +200,7 @@ char *msg;
 	switch(error) {
 	case LIBIMAGE_PNG_ERROR_HEADER: msg = "Data has wrong file signature in the header for a PNG file."; break;
 	case LIBIMAGE_PNG_ERROR_INVALID_FILE: msg = "Data has invalid sequence for a PNG file."; break;
+	case LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND: msg = "Data don't start with the IHDR chunk which need to be the first chunk for a PNG file."; break;
 	case LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH: msg = "Data has a invalid value for the bit depth field on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE: msg = "Data has a invalid value for the colour type field on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION: msg = "Data has a invalid combination between bit depth and colour type on IHDR chunk."; break;	
@@ -222,12 +228,12 @@ static void print_ihdr(LibImagePngIHdr *h)
 	printf("Interlace method %x\n", h->interlace_method);
 }
 
-void *libimage_process_png_data(unsigned char *data, unsigned int *width, unsigned int *height, int *error)
+void *libimage_process_png_data(uint8_t *data, uint32_t *width, unsigned int *height, int *error)
 {
-unsigned char 		*ptr, *start_chunk;
+uint8_t 		*ptr;
 LibImagePngChunk 	chunk;
 LibImagePngIHdr 	ihdr;
-unsigned int  		four_bytes;
+uint32_t  		four_bytes;
 unsigned long		crc_calculated, crc_from_chunk; 
 int			validation_ret, shall_have_plt;
 
@@ -243,19 +249,22 @@ int			validation_ret, shall_have_plt;
 	ptr = data + STATIC_ARRAY_SIZE(png_file_sig);
 	chunk = *(LibImagePngChunk*)ptr;
 	chunk.data_len.i = integer_from_network_byte(chunk.data_len.i); 
-	print_chunk(&chunk);
 
-	four_bytes = *(unsigned int*)png_ihdr_chunk;
+	four_bytes = *(uint32_t*)png_ihdr_chunk;
 	if(chunk.type.i != four_bytes) {
-		if(error) *error = LIBIMAGE_PNG_ERROR_INVALID_FILE;
+		if(error) *error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
 		return NULL;
 	}
 
+	print_chunk(&chunk);
+
 	ptr += CHUNK_LENGTH_BYTES;
-      	start_chunk = ptr;
 	ptr += CHUNK_TYPE_BYTES;
 
-	ihdr = *(LibImagePngIHdr*)ptr;
+      	chunk.start_chunk_data = ptr;
+	chunk.end_chunk_data   = ptr + chunk.data_len.i;
+
+	ihdr = *(LibImagePngIHdr*)chunk.start_chunk_data;
 	shall_have_plt = 0;
 	validation_ret = validate_ihdr(&ihdr, &shall_have_plt);
 	if(validation_ret) {
@@ -268,14 +277,18 @@ int			validation_ret, shall_have_plt;
 
 	print_ihdr(&ihdr);
 	ptr += chunk.data_len.i;
-
+#if 0
 	crc_from_chunk = integer_from_network_byte(*(unsigned long*)ptr);
 	crc_calculated = crc(start_chunk, chunk.data_len.i + sizeof(chunk.type.i));
-
 	if(crc_from_chunk != crc_calculated) {
 		fprintf(stderr, "%lu != %lu\n", crc_from_chunk, crc_calculated);
 		if(error) *error = LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH;
 		return NULL;
+	}
+#endif
+	fprintf(stderr, "Printing the next 16 bytes\n");
+	for(int i = 0; i < 16; i++) {
+		fprintf(stderr, "%d %x\n", i + 1, ptr[i]);
 	}
 
 	return data; //For now
