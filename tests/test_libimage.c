@@ -58,9 +58,10 @@ void usage(int code)
 
 int main(int argc, char **argv)
 {
-char *file_contents, *path, error_buffer[1024];
-int  size, width, height, error;
-void *ptr;
+char 		*file_contents, *path, error_buffer[1024];
+int  		size,  error;
+unsigned int 	width, height;
+void 		*ptr;
 
 	if(argc < 2) usage(EXIT_FAILURE);	
 
@@ -80,6 +81,9 @@ void *ptr;
 		libimage_error_code_to_msg(error_buffer, sizeof(error_buffer), error);
 		fprintf(stderr, "%s\n", error_buffer);
 	}
+
+	fprintf(stderr, "Got width equal to %u\n", width);
+	fprintf(stderr, "Got height equal to %u\n", height);
 
 	free(file_contents);
 	return 0;
