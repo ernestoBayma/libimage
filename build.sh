@@ -112,7 +112,7 @@ echo "[INFO]: Compiling libimage"
 sleep 1
 
 if [ ! -z "$DEBUG_MODE" ]; then
-	COMPILER_FLAGS= "$COMPILER_FLAGS"" -DDEBUG=1 -g -ggdb3 -O0"
+	COMPILER_FLAGS="$COMPILER_FLAGS"" -DDEBUG=1 -g -ggdb3 -O0"
 else
 	COMPILER_FLAGS="$COMPILER_FLAGS"" -DRELEASE=1 -O2" 
 fi
