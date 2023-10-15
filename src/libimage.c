@@ -2,7 +2,66 @@
  *	
  *	Reference for png: https://www.w3.org/TR/2003/REC-PNG-20031110 and http://www.libpng.org/pub/png/spec/1.2/PNG-Structure.html
  *
+ *
  */
+/*
+*	Zlib data format
+*	Byte 0 -> CMF
+*	Byte 1 -> FLG
+*	if FLG.FDICT set
+*
+*	4 bytes for DICTID
+*	Then Compressed data
+*	Then 4 bytes for the ADLER32
+*
+*	Any data that appear after ADLER32 are not part of the zlib stream
+*
+*	CMF ( Compression method and flags )
+*	A byte divided between 4 bits for compression method and 4 bits for information field
+*
+*	CM ( Compression method) 
+*		CM = 8 Represents the deflate compression with a window size up to 32k, this is used by gzip and PNG.
+*		CM = 15 is Reserved.
+*	CINFO ( Compression info )
+*		CM = 8 , CINFO is the base 2 log of the LZ77 window size minus eight ( EX: CINFO=7 indicates a 32K window size).
+*			values above 7 is not allowed 
+*	FLG (Flags)
+*		bits 0 to 4 FCHECK ( check bits for CMF and FLG )
+*		bit 5 	    FDICT (preset dictionary )
+*		bits 6 to 7 FLEVEL (compression level )
+*
+*		The FCHECK value must be such that CMF and FLG, when viewed as a uint16_t stored in Network order (CMF*256 + FLG ) is a
+*		multiple of 31.
+*
+*		FDICT ( Preset dictionary )
+*			If FDICT is set, a DICT dictionary identifier is present immediately afther the FLG byte. The dictionary is a sequence of bytes
+*			which are initially fed to the compressor without producing any compressed output. DICT is the Adler-32 checksum of this sequence of 
+*			bytes. The decompressor can use this identifier to determine which dictionary has been used by the compressor.
+*		FLEVEL ( Compression level )
+* 			Not needed for decompression
+* 		Compressed data
+* 			For the method 8, data is stored in the deflate method.
+* 		ADLER32 (Adler-32 checksum)
+* 			This contains a checksum value of the uncompressed data -> Validation of the decompression.
+*	 			
+*		A compliant decompressor must check CMF, FLG, and ADLER32, and
+*		provide an error indication if any of these have incorrect values.
+*		A compliant decompressor must give an error indication if CM is
+*		not one of the values defined in this specification (only the
+*		value 8 is permitted in this version), since another value could
+*		indicate the presence of new features that would cause subsequent
+*		data to be interpreted incorrectly.  A compliant decompressor must
+*		give an error indication if FDICT is set and DICTID is not the
+*		identifier of a known preset dictionary.  A decompressor may
+*		ignore FLEVEL and still be compliant.  When the zlib data format
+*		is being used as a part of another standard format, a compliant
+*		decompressor must support all the preset dictionaries specified by
+*		the other format. When the other format does not use the preset
+*		dictionary feature, a compliant decompressor must reject any
+*		stream in which the FDICT flag is set.
+* 
+ */
+
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,7 +78,12 @@ enum {
 	LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH,
 	LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE,
 	LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION,
-	LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH
+	LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH,
+	LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED
+};
+
+enum {
+	LIBIMAGE_TYPE_PNG = 1
 };
 
 #define CHUNK_LENGTH_BYTES	4
@@ -30,85 +94,27 @@ enum {
 static uint8_t png_file_sig[]   = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
 static uint8_t png_ihdr_chunk[] = { 73, 72, 68, 82 };	
 static uint8_t png_iend_chunk[] = { 73, 69, 78, 68 };
-
-/*
- * 3.4. CRC algorithm
- *
- * Chunk CRCs are calculated using standard CRC methods with pre and post conditioning, as defined by ISO 3309 [ISO-3309] or ITU-T V.42 [ITU-T-V42]. The CRC polynomial employed is
- *
- *    x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1
- *
- *    The 32-bit CRC register is initialized to all 1's, and then the data from each byte is processed from the least significant bit (1) to the most significant bit (128). After all the data bytes are processed, the CRC register is inverted (its ones complement is taken). This value is transmitted (stored in the file) MSB first. For the purpose of separating into bytes and ordering, the least significant bit of the 32-bit CRC is defined to be the coefficient of the x31 term. 
-*/
-/* Table of CRCs of all 8-bit messages. */
-static unsigned long crc_table[256];
-/* Flag: has the table been computed? Initially false. */
-int crc_table_computed = 0;
-/* Make the table for a fast CRC. */
-void make_crc_table(void)
-{
-	unsigned long c;
-	int n, k;
-
-	for (n = 0; n < 256; n++) {
-		c = (unsigned long) n;
-		for (k = 0; k < 8; k++) {
-			if (c & 1)
-				c = 0xedb88320L ^ (c >> 1);
-			else
-				c = c >> 1;
-		}
-		crc_table[n] = c;
-	}
-	crc_table_computed = 1;
-}
-   
-/* Update a running CRC with the bytes buf[0..len-1]--the CRC
-*       should be initialized to all 1's, and the transmitted value
-*             is the 1's complement of the final running CRC (see the
-*                   crc() routine below)). */
-unsigned long update_crc(unsigned long crc, uint8_t *buf, int len)
-{
-unsigned long c = crc;
-int n;
-
-	if (!crc_table_computed)
-		make_crc_table();
-	for (n = 0; n < len; n++) {
-		c = crc_table[(c ^ buf[n]) & 0xff] ^ (c >> 8);
-	}
-	return c;
-}
-
-/* Return the CRC of the bytes buf[0..len-1]. */
-unsigned long crc(uint8_t *buf, int len)
-{
-	return update_crc(0xffffffffL, buf, len) ^ 0xffffffffL;
-}
-
-/*
- * 3.2. Chunk layout
- *
- *
- * Length
- *     A 4-byte unsigned integer giving the number of bytes in the chunk's data field. The length counts only the data field, not itself, the chunk type code, or the CRC. Zero is a valid length. Although encoders and decoders should treat the length as unsigned, its value must not exceed 231 bytes.
- *
- *     Chunk Type
- *         A 4-byte chunk type code. For convenience in description and in examining PNG files, type codes are restricted to consist of uppercase and lowercase ASCII letters (A-Z and a-z, or 65-90 and 97-122 decimal). However, encoders and decoders must treat the codes as fixed binary values, not character strings. For example, it would not be correct to represent the type code IDAT by the EBCDIC equivalents of those letters. Additional naming conventions for chunk types are discussed in the next section.
- *
- *         Chunk Data
- *             The data bytes appropriate to the chunk type, if any. This field can be of zero length.
- *
- *             CRC
- *                 A 4-byte CRC (Cyclic Redundancy Check) calculated on the preceding bytes in the chunk, including the chunk type code and chunk data fields, but not including the length field. The CRC is always present, even for chunks containing no data. See CRC algorithm.
- *
- *                 The chunk data length can be any number of bytes up to the maximum; therefore, implementors cannot assume that chunks are aligned on any boundaries larger than bytes.
- *
- *                 Chunks can appear in any order, subject to the restrictions placed on each chunk type. (One notable restriction is that IHDR must appear first and IEND must appear last; thus the IEND chunk serves as an end-of-file marker.) Multiple chunks of the same type can appear, but only if specifically permitted for that type. 
- */
+static uint32_t u32_bswap(uint32_t value);
 
 // A valid PNG datastream shall begin with a PNG signature, immediately followed by an IHDR chunk, then one or more IDAT chunks, and shall end with an IEND chunk. Only one IHDR chunk and one IEND chunk are allowed in a PNG datastream.
-
+/*
+*
+* 	3.2. Chunk layout
+* 	Length
+*     		A 4-byte unsigned integer giving the number of bytes in the chunk's data field. The length counts only the data field, not itself, the chunk type code, or the CRC. Zero is a valid length. Although encoders and decoders should treat the length as unsigned, its value must not exceed 231 bytes.
+*
+*     Chunk Type
+*         	A 4-byte chunk type code. For convenience in description and in examining PNG files, type codes are restricted to consist of uppercase and lowercase ASCII letters 
+*         	(A-Z and a-z, or 65-90 and 97-122 decimal). However, encoders and decoders must treat the codes as fixed binary values, not character strings. 
+*         	For example, it would not be correct to represent the type code IDAT by the EBCDIC equivalents of those letters. Additional naming conventions for chunk types are discussed in the next section.
+*         Chunk Data
+*             	The data bytes appropriate to the chunk type, if any. This field can be of zero length.
+*         CRC
+*             	A 4-byte CRC (Cyclic Redundancy Check) calculated on the preceding bytes in the chunk, including the chunk type code and chunk data fields, but not including the length field. The CRC is always present, even for chunks containing no data.
+*               The chunk data length can be any number of bytes up to the maximum; therefore, implementors cannot assume that chunks are aligned on any boundaries larger than bytes.
+*
+*         Chunks can appear in any order, subject to the restrictions placed on each chunk type. (One notable restriction is that IHDR must appear first and IEND must appear last; thus the IEND chunk serves as an end-of-file marker.) Multiple chunks of the same type can appear, but only if specifically permitted for that type. 
+*/
 typedef struct libimage_png_chunk {
 	union {
 		uint8_t b[4]; // Is unsigned but should not be bigger than 2^31 - 1 bytes.
@@ -126,9 +132,9 @@ typedef struct libimage_png_chunk {
 		uint8_t b[4];
 		uint32_t  i;
 	} crc;      		// calculated on the preceding bytes in the chunk, including the chunk type field and chunk data fields, but not including the length field.
+				
+	struct libimage_png_chunk *next;
 } LibImagePngChunk;
-
-
 /*
  *
  * Width and height give the image dimensions in pixels. They are PNG four-byte uint32_tegers. Zero is an invalid value.
@@ -149,6 +155,147 @@ typedef struct libimage_png_ihdr {
 	uint8_t filter_method;
 	uint8_t interlace_method;
 } LibImagePngIHdr;
+static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE);
+
+typedef struct libimage_png_plte {
+	char rgb[3];
+} LibImagePngPLTE;
+
+typedef struct libimage_data_reader {
+	uint8_t 	*data;
+	uint16_t	type;
+	uint16_t	error;
+	uint32_t	cursor;
+	uint32_t	peek_cursor;
+} LibImageDataReader;
+
+
+static void print_chunk(LibImagePngChunk *c)
+{
+	printf("Data_len %d\n", c->data_len.i);
+	printf("type %s\n", c->type.b);
+}
+
+static void print_ihdr(LibImagePngIHdr *h)
+{
+	printf("Width  %x\n", 		h->width);
+	printf("Height %x\n", 		h->height);
+	printf("Bit depth %x\n", 	h->bit_depth);
+	printf("Color type %x\n", 	h->colour_type);
+	printf("Compression method %x\n", h->compression_method);
+	printf("Filter method %x\n", h->filter_method);
+	printf("Interlace method %x\n", h->interlace_method);
+}
+
+
+/*
+*
+*    CRC algorithm
+*
+*    Chunk CRCs are calculated using standard CRC methods with pre and post conditioning, as defined by ISO 3309 [ISO-3309] or ITU-T V.42 [ITU-T-V42]. 
+*    The CRC polynomial employed is x^32+x^26+x^23+x^22+x^16+x^12+x^11+x^10+x^8+x^7+x^5+x^4+x^2+x+1
+*
+*    The 32-bit CRC register is initialized to all 1's, and then the data from each byte is processed from the least significant bit (1) to the most significant bit (128). 
+*    After all the data bytes are processed, the CRC register is inverted (its ones complement is taken). 
+*    This value is transmitted (stored in the file) MSB first. For the purpose of separating into bytes and ordering, the least significant bit of the 32-bit CRC is defined 
+*    to be the coefficient of the x31 term. 
+*
+*/
+
+#define CRC_POLYNOMIAL 		0xebd88320L
+#define MAX_CRC_TABLE_VALUE	256
+#define ALL_32_BITS_SET		0xffffffffL
+
+/* Table of CRCs of all 8-bit messages. */
+static uint32_t crc_table[256];
+/* Flag: has the table been computed? Initially false. */
+static int crc_table_computed = 0;
+/* Make the table for a fast CRC. */
+void make_crc_table(void)
+{
+uint32_t 	c;
+int 		n, k;
+
+	for (n = 0; n < MAX_CRC_TABLE_VALUE; n++) {
+		c = (unsigned long) n;
+		for (k = 0; k < 8; k++) {
+			c = c & 1 ? (c >> 1) ^ CRC_POLYNOMIAL : c >> 1;
+		}
+		crc_table[n] = c;
+	}
+	crc_table_computed = 1;
+}
+   
+/* 
+* 	Based on the Annex D code of the PNG Spec And zlib
+*/
+uint32_t crc(uint8_t *buf, int len, int offset_bytes)
+{
+uint32_t result;
+int	 n;
+	if (!crc_table_computed)
+		make_crc_table();
+
+	result = 0;
+	result = (~result) & ALL_32_BITS_SET;
+
+	while(len >= 8) {
+		len -= 8;
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+	}
+
+	while(len) {
+		len--;	
+		result = (result >> 8) ^ crc_table[(result ^ *buf++) & 0xff];
+	}
+
+	result = result ^ ALL_32_BITS_SET;
+	result = u32_bswap(result);
+	return result;
+}
+
+static int check_png_signature(LibImageDataReader *r)
+{
+uint64_t sig_to_check, correct_sig;
+	correct_sig 	= *(uint64_t*)png_file_sig;
+	sig_to_check	= *(uint64_t*)r->data;	
+
+	if(sig_to_check != sig_to_check) return -1;
+	return 0;
+}
+
+static int check_data_header(LibImageDataReader *r)
+{
+	if(r->type == LIBIMAGE_TYPE_PNG) {
+		return check_png_signature(r);
+			
+	} else {
+		r->error = LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED;
+		return -1;
+	}
+}
+
+static void consume_bytes(LibImageDataReader *r, int n)
+{
+	r->cursor+=n;
+}
+
+static uint8_t *read_from_reader(LibImageDataReader *r)
+{
+	return r->data + r->cursor;
+}
+
+static uint8_t *peek_from_reader(LibImageDataReader *r, int n)
+{
+	return r->data + r->cursor + n;
+}
 
 static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
 {
@@ -179,7 +326,47 @@ static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
 	return 0;
 }
 
-uint32_t integer_from_network_byte(uint32_t value)
+static void read_start_chunk(LibImagePngChunk *c, LibImageDataReader *r, int *shall_have_plt, int *width, int *height)
+{
+int			validation_ret;
+LibImagePngIHdr 	ihdr;
+
+	consume_bytes(r, STATIC_ARRAY_SIZE(png_file_sig));
+
+	c->type.i = *(uint32_t*) peek_from_reader(r, 4);
+	// Every PNG need to start with the ihdr chunk
+	if(c->type.i != (*(uint32_t*)png_ihdr_chunk)) {
+		r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+		return;
+	}
+	c->data_len.i 	= u32_bswap(*(uint32_t*)read_from_reader(r));
+	consume_bytes(r, 8);	
+
+	c->start_chunk_data 	= read_from_reader(r);
+	c->end_chunk_data 	= peek_from_reader(r, c->data_len.i);
+	consume_bytes(r, c->data_len.i);
+
+	c->crc.i   	= *(uint32_t*)read_from_reader(r);
+
+	ihdr = *(LibImagePngIHdr*)(c->start_chunk_data);
+	if(shall_have_plt) *shall_have_plt = 0;
+	validation_ret = validate_ihdr(&ihdr, shall_have_plt);
+	if(validation_ret) {
+		r->error = validation_ret; 
+		return;
+	}
+
+	if(width) 	*width 	= u32_bswap(ihdr.width);
+	if(height)	*height = u32_bswap(ihdr.height);
+
+#if 1
+	print_ihdr(&ihdr);
+#endif
+
+	c->next 	= NULL;
+}
+
+uint32_t u32_bswap(uint32_t value)
 {
 int  	i, total;	
 union   { uint32_t i; char b[4]; } test = { 0x01020304 };
@@ -205,90 +392,40 @@ char *msg;
 	case LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE: msg = "Data has a invalid value for the colour type field on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION: msg = "Data has a invalid combination between bit depth and colour type on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH: msg = "Data has a calculated crc that don't match the crc on the chunk."; break;
+	case LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED: msg = "Data has not supported header info."; break;
 	default: msg = "Unknown error. RUN."; break;
 	}
 
 	snprintf(buffer, buffer_size, "%s", msg);
 }
 
-static void print_chunk(LibImagePngChunk *c)
-{
-	printf("Data_len %d\n", c->data_len.i);
-	printf("type %s\n", c->type.b);
-}
-
-static void print_ihdr(LibImagePngIHdr *h)
-{
-	printf("Width  %x\n", 		h->width);
-	printf("Height %x\n", 		h->height);
-	printf("Bit depth %x\n", 	h->bit_depth);
-	printf("Color type %x\n", 	h->colour_type);
-	printf("Compression method %x\n", h->compression_method);
-	printf("Filter method %x\n", h->filter_method);
-	printf("Interlace method %x\n", h->interlace_method);
-}
-
 void *libimage_process_png_data(uint8_t *data, uint32_t *width, unsigned int *height, int *error)
 {
-uint8_t 		*ptr;
 LibImagePngChunk 	chunk;
 LibImagePngIHdr 	ihdr;
-uint32_t  		four_bytes;
-unsigned long		crc_calculated, crc_from_chunk; 
+LibImageDataReader	reader;
+uint32_t  		four_bytes, crc_calculated;
 int			validation_ret, shall_have_plt;
 
 	if(width)  *width  = 0;
 	if(height) *height = 0;
 	if(error)  *error  = 0;
 
-	if(memcmp(data, png_file_sig, STATIC_ARRAY_SIZE(png_file_sig)) != 0) {
-		if(error) *error = LIBIMAGE_PNG_ERROR_HEADER;
+	reader.data 		= data;
+	reader.type		= LIBIMAGE_TYPE_PNG;
+	reader.error		= 0;
+	reader.cursor 		= 0;
+	reader.peek_cursor	= 0;
+
+	if(check_data_header(&reader)) {
+		if(error) *error = reader.error;
 		return NULL;
 	}
 
-	ptr = data + STATIC_ARRAY_SIZE(png_file_sig);
-	chunk = *(LibImagePngChunk*)ptr;
-	chunk.data_len.i = integer_from_network_byte(chunk.data_len.i); 
-
-	four_bytes = *(uint32_t*)png_ihdr_chunk;
-	if(chunk.type.i != four_bytes) {
-		if(error) *error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+	read_start_chunk(&chunk, &reader, &shall_have_plt, width, height);
+	if(reader.error) {
+		if(error) *error = reader.error;
 		return NULL;
-	}
-
-	print_chunk(&chunk);
-
-	ptr += CHUNK_LENGTH_BYTES;
-	ptr += CHUNK_TYPE_BYTES;
-
-      	chunk.start_chunk_data = ptr;
-	chunk.end_chunk_data   = ptr + chunk.data_len.i;
-
-	ihdr = *(LibImagePngIHdr*)chunk.start_chunk_data;
-	shall_have_plt = 0;
-	validation_ret = validate_ihdr(&ihdr, &shall_have_plt);
-	if(validation_ret) {
-		if(error) *error = validation_ret;
-		return NULL;
-	}
-
-	if(width)  *width  = integer_from_network_byte(ihdr.width);
-	if(height) *height = integer_from_network_byte(ihdr.height);
-
-	print_ihdr(&ihdr);
-	ptr += chunk.data_len.i;
-#if 0
-	crc_from_chunk = integer_from_network_byte(*(unsigned long*)ptr);
-	crc_calculated = crc(start_chunk, chunk.data_len.i + sizeof(chunk.type.i));
-	if(crc_from_chunk != crc_calculated) {
-		fprintf(stderr, "%lu != %lu\n", crc_from_chunk, crc_calculated);
-		if(error) *error = LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH;
-		return NULL;
-	}
-#endif
-	fprintf(stderr, "Printing the next 16 bytes\n");
-	for(int i = 0; i < 16; i++) {
-		fprintf(stderr, "%d %x\n", i + 1, ptr[i]);
 	}
 
 	return data; //For now
