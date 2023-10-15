@@ -1,3 +1,8 @@
+/*
+ *	http://www.schaik.com/pngsuite/ -> The "Official" test-suite for PNG.
+ *
+ */
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -76,7 +81,7 @@ void 		*ptr;
 		return -1;
 	}
 
-	ptr = libimage_process_png_data(file_contents, &width, &height, &error);
+	ptr = libimage_process_data(file_contents, &width, &height, &error);
 	if(error != 0) {
 		libimage_error_code_to_msg(error_buffer, sizeof(error_buffer), error);
 		fprintf(stderr, "%s\n", error_buffer);

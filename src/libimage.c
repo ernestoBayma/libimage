@@ -79,6 +79,10 @@ enum {
 	LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE,
 	LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION,
 	LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH,
+	LIBIMAGE_PNG_ERROR_MULTIPLE_IHDR,
+	LIBIMAGE_PNG_ERROR_NO_IDAT,
+	LIBIMAGE_PNG_ERROR_NO_PLT,
+	LIBIMAGE_PNG_ERROR_UNEXPECTED_PLTE,
 	LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED
 };
 
@@ -86,15 +90,24 @@ enum {
 	LIBIMAGE_TYPE_PNG = 1
 };
 
-#define CHUNK_LENGTH_BYTES	4
-#define CHUNK_TYPE_BYTES	4
-#define CHUNK_CRC_BYTES		4
-#define IS_POWER_OF_TWO(num)	(((int)(num)) & ((((int)num) - 1)))
+
+uint32_t u32_bswap(uint32_t value);
+
+#define PNG_COLOR_TYPE_GREYSCALE 		0 // Each pixel is a greyscale sample
+#define PNG_COLOR_TYPE_TRUECOLOUR		2 // Each pixel is a R,G,B triple
+#define PNG_COLOR_TYPE_INDEXED_COLOUR		3 // Each pixel is a palette index; a PLTE chunk shall appear.
+#define PNG_COLOR_TYPE_GREYSCALE_WITH_ALPHA	4 // Each pixel is a greyscale sample followed by an alpha sample.
+#define PNG_COLOR_TYPE_TRUE_COLOUR_WITH_ALPHA	6 // Each pixel is an R,G,B triple followed by an alpha sample.
+
+#define CHUNK_LENGTH_BYTES		4
+#define CHUNK_TYPE_BYTES		4
+#define CHUNK_CRC_BYTES			4
+#define MAXIMUM_LOOP_ALLOWED		UINT64_MAX - 1
+
+#define IS_POWER_OF_TWO(num)		(((int)(num)) & ((((int)num) - 1)))
+#define LIBIMAGE_PNG_TYPE(a,b,c,d) 	(((uint32_t)((a) << 24)) + ((uint32_t)((b) << 16)) + ((uint32_t)((c) << 8)) + (uint32_t)(d))
 
 static uint8_t png_file_sig[]   = { 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a };
-static uint8_t png_ihdr_chunk[] = { 73, 72, 68, 82 };	
-static uint8_t png_iend_chunk[] = { 73, 69, 78, 68 };
-static uint32_t u32_bswap(uint32_t value);
 
 // A valid PNG datastream shall begin with a PNG signature, immediately followed by an IHDR chunk, then one or more IDAT chunks, and shall end with an IEND chunk. Only one IHDR chunk and one IEND chunk are allowed in a PNG datastream.
 /*
@@ -135,6 +148,16 @@ typedef struct libimage_png_chunk {
 				
 	struct libimage_png_chunk *next;
 } LibImagePngChunk;
+
+
+typedef struct libimage_image_info {
+	uint32_t width;
+	uint32_t height;
+	uint32_t gamma;
+	uint8_t  *data;
+	uint8_t  color_type;
+} LibImageImageInfo;
+
 /*
  *
  * Width and height give the image dimensions in pixels. They are PNG four-byte uint32_tegers. Zero is an invalid value.
@@ -155,7 +178,7 @@ typedef struct libimage_png_ihdr {
 	uint8_t filter_method;
 	uint8_t interlace_method;
 } LibImagePngIHdr;
-static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE);
+static int validate_ihdr(LibImagePngIHdr *h, LibImageImageInfo *i);
 
 typedef struct libimage_png_plte {
 	char rgb[3];
@@ -169,11 +192,19 @@ typedef struct libimage_data_reader {
 	uint32_t	peek_cursor;
 } LibImageDataReader;
 
-
-static void print_chunk(LibImagePngChunk *c)
+static void consume_bytes(LibImageDataReader *r, int n)
 {
-	printf("Data_len %d\n", c->data_len.i);
-	printf("type %s\n", c->type.b);
+	r->cursor+=n;
+}
+
+static uint8_t *read_from_reader(LibImageDataReader *r)
+{
+	return r->data + r->cursor;
+}
+
+static uint8_t *peek_from_reader(LibImageDataReader *r, int n)
+{
+	return r->data + r->cursor + n;
 }
 
 static void print_ihdr(LibImagePngIHdr *h)
@@ -186,8 +217,6 @@ static void print_ihdr(LibImagePngIHdr *h)
 	printf("Filter method %x\n", h->filter_method);
 	printf("Interlace method %x\n", h->interlace_method);
 }
-
-
 /*
 *
 *    CRC algorithm
@@ -201,7 +230,6 @@ static void print_ihdr(LibImagePngIHdr *h)
 *    to be the coefficient of the x31 term. 
 *
 */
-
 #define CRC_POLYNOMIAL 		0xebd88320L
 #define MAX_CRC_TABLE_VALUE	256
 #define ALL_32_BITS_SET		0xffffffffL
@@ -268,36 +296,23 @@ uint64_t sig_to_check, correct_sig;
 	sig_to_check	= *(uint64_t*)r->data;	
 
 	if(sig_to_check != sig_to_check) return -1;
+
+	consume_bytes(r, sizeof(correct_sig));
 	return 0;
 }
 
 static int check_data_header(LibImageDataReader *r)
 {
-	if(r->type == LIBIMAGE_TYPE_PNG) {
-		return check_png_signature(r);
-			
+	if(check_png_signature(r) == 0) {
+		r->type = LIBIMAGE_TYPE_PNG;
 	} else {
 		r->error = LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED;
 		return -1;
 	}
+	return 0;	
 }
 
-static void consume_bytes(LibImageDataReader *r, int n)
-{
-	r->cursor+=n;
-}
-
-static uint8_t *read_from_reader(LibImageDataReader *r)
-{
-	return r->data + r->cursor;
-}
-
-static uint8_t *peek_from_reader(LibImageDataReader *r, int n)
-{
-	return r->data + r->cursor + n;
-}
-
-static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
+static int validate_ihdr(LibImagePngIHdr *h, LibImageImageInfo *i)
 {
 	if(h == NULL) return 0;
 	
@@ -308,61 +323,58 @@ static int validate_ihdr(LibImagePngIHdr *h, int *shall_have_PLTE)
 	if(h->bit_depth != 1 && h->bit_depth & 1) return LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH;
 
 	switch(h->colour_type) {
-		case 0: {
+		case PNG_COLOR_TYPE_GREYSCALE: {
 			if(h->bit_depth != 1 && (IS_POWER_OF_TWO(h->bit_depth) == 0)) return LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION;
 
 		} break;
-		case 6:
-		case 4:
-		case 2: {
+		case PNG_COLOR_TYPE_TRUE_COLOUR_WITH_ALPHA:
+		case PNG_COLOR_TYPE_GREYSCALE_WITH_ALPHA:
+		case PNG_COLOR_TYPE_TRUECOLOUR: {
 			if(h->bit_depth != 8 && h->bit_depth != 16) return LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION;
 		} break;
-		case 3: {
+		case PNG_COLOR_TYPE_INDEXED_COLOUR: {
 			if(h->bit_depth != 1 && h->bit_depth > 8 && (IS_POWER_OF_TWO(h->bit_depth) == 0)) return LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION;
-			if(shall_have_PLTE) *shall_have_PLTE = 1;
 		} break;
 	}
 
+	i->color_type = h->colour_type;
 	return 0;
 }
 
-static void read_start_chunk(LibImagePngChunk *c, LibImageDataReader *r, int *shall_have_plt, int *width, int *height)
+LibImagePngChunk read_png_chunk(LibImageDataReader *r)
+{
+LibImagePngChunk c = {0};
+	
+	c.data_len.i = u32_bswap(*(uint32_t*)read_from_reader(r)); 
+	c.type.i     = u32_bswap(*(uint32_t*)peek_from_reader(r, 4));
+
+	consume_bytes(r, 8);
+	c.start_chunk_data = read_from_reader(r);
+	c.end_chunk_data   = peek_from_reader(r, c.data_len.i - 1);
+	consume_bytes(r, c.data_len.i);
+
+	c.crc.i      = u32_bswap(*(uint32_t*)read_from_reader(r));
+
+	consume_bytes(r, 4);
+	return c;
+}
+
+static void process_ihdr_chunk(LibImagePngChunk *c, LibImageDataReader *r, LibImageImageInfo *info)
 {
 int			validation_ret;
 LibImagePngIHdr 	ihdr;
 
-	consume_bytes(r, STATIC_ARRAY_SIZE(png_file_sig));
-
-	c->type.i = *(uint32_t*) peek_from_reader(r, 4);
-	// Every PNG need to start with the ihdr chunk
-	if(c->type.i != (*(uint32_t*)png_ihdr_chunk)) {
-		r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
-		return;
-	}
-	c->data_len.i 	= u32_bswap(*(uint32_t*)read_from_reader(r));
-	consume_bytes(r, 8);	
-
-	c->start_chunk_data 	= read_from_reader(r);
-	c->end_chunk_data 	= peek_from_reader(r, c->data_len.i);
-	consume_bytes(r, c->data_len.i);
-
-	c->crc.i   	= *(uint32_t*)read_from_reader(r);
-
 	ihdr = *(LibImagePngIHdr*)(c->start_chunk_data);
-	if(shall_have_plt) *shall_have_plt = 0;
-	validation_ret = validate_ihdr(&ihdr, shall_have_plt);
+	validation_ret = validate_ihdr(&ihdr, info);
 	if(validation_ret) {
 		r->error = validation_ret; 
 		return;
 	}
-
-	if(width) 	*width 	= u32_bswap(ihdr.width);
-	if(height)	*height = u32_bswap(ihdr.height);
-
+	info->width 	= u32_bswap(ihdr.width);
+	info->height	= u32_bswap(ihdr.height);
 #if 1
 	print_ihdr(&ihdr);
 #endif
-
 	c->next 	= NULL;
 }
 
@@ -392,6 +404,10 @@ char *msg;
 	case LIBIMAGE_PNG_ERROR_IHDR_COLOUR_TYPE: msg = "Data has a invalid value for the colour type field on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_IHDR_BIT_DEPTH_COMBINATION: msg = "Data has a invalid combination between bit depth and colour type on IHDR chunk."; break;	
 	case LIBIMAGE_PNG_ERROR_CRC_NOT_MATCH: msg = "Data has a calculated crc that don't match the crc on the chunk."; break;
+	case LIBIMAGE_PNG_ERROR_MULTIPLE_IHDR: msg = "Data has multiple IHDR chunks. Which is not supported by the PNG spec."; break;
+	case LIBIMAGE_PNG_ERROR_NO_IDAT: msg = "Data has no IDAT chunk for a PNG file."; break;
+	case LIBIMAGE_PNG_ERROR_NO_PLT:  msg = "Expected a PLTE chunk based on Image type field from IHDR, but none was found."; break; 
+	case LIBIMAGE_PNG_ERROR_UNEXPECTED_PLTE:  msg = "Got a PLTE but chunk Image type field from IHDR don't support it."; break; 
 	case LIBIMAGE_ERROR_TYPE_NOT_SUPPORTED: msg = "Data has not supported header info."; break;
 	default: msg = "Unknown error. RUN."; break;
 	}
@@ -399,20 +415,85 @@ char *msg;
 	snprintf(buffer, buffer_size, "%s", msg);
 }
 
-void *libimage_process_png_data(uint8_t *data, uint32_t *width, unsigned int *height, int *error)
+void libimage_process_png(LibImageDataReader *r, LibImageImageInfo *info)
 {
 LibImagePngChunk 	chunk;
-LibImagePngIHdr 	ihdr;
+uint32_t		first_chunk = 1, got_idat_chunk = 0, got_plte_chunk = 0;
+uint64_t		loop_count;
+
+	for(loop_count = 0; loop_count < MAXIMUM_LOOP_ALLOWED; loop_count++) {
+		chunk = read_png_chunk(r);
+		switch(chunk.type.i) {
+			case LIBIMAGE_PNG_TYPE('I','H','D','R'): {
+				if(!first_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_MULTIPLE_IHDR;
+					return;
+				}
+				process_ihdr_chunk(&chunk, r, info);
+				first_chunk = 0;
+			} break;
+			case LIBIMAGE_PNG_TYPE('g','A','M','A'): {
+				if(first_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+					return;
+				}
+				info->gamma = u32_bswap(*(uint32_t*)chunk.start_chunk_data);
+			} break;
+			case LIBIMAGE_PNG_TYPE('P','L','T','E'): {
+				if(first_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+					return;
+				}
+				if(info->color_type == PNG_COLOR_TYPE_GREYSCALE
+					  	|| info->color_type == PNG_COLOR_TYPE_GREYSCALE_WITH_ALPHA) {
+					r->error = LIBIMAGE_PNG_ERROR_UNEXPECTED_PLTE;
+					return;
+				}
+				got_plte_chunk = 1;
+			} break;
+			case LIBIMAGE_PNG_TYPE('I','D','A','T'): {
+				if(first_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+					return;
+				}
+				got_idat_chunk = 1;
+				fprintf(stderr, "Implement the real thing\n"); //TODO ern
+			} break;
+			case LIBIMAGE_PNG_TYPE('I','E','N','D'): {
+				if(first_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_IHDR_NOT_FOUND;
+					return;
+				}
+				if(!got_idat_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_NO_IDAT;
+					return;
+				}
+				if(info->color_type == PNG_COLOR_TYPE_INDEXED_COLOUR && !got_plte_chunk) {
+					r->error = LIBIMAGE_PNG_ERROR_NO_PLT;
+					return;
+				}
+				fprintf(stderr, "Got to the end of the file\n");
+				return;
+			} break;			 
+			default:
+				fprintf(stderr, "Type is %s(%x) which is not supported.\n", chunk.type.b, chunk.type.i); //TODO ern
+				goto bail;
+			break;
+		}
+	}
+bail:
+}
+
+void *libimage_process_data(uint8_t *data, uint32_t *width, unsigned int *height, int *error)
+{
 LibImageDataReader	reader;
-uint32_t  		four_bytes, crc_calculated;
-int			validation_ret, shall_have_plt;
+LibImageImageInfo	info 	= {0};
 
 	if(width)  *width  = 0;
 	if(height) *height = 0;
 	if(error)  *error  = 0;
 
 	reader.data 		= data;
-	reader.type		= LIBIMAGE_TYPE_PNG;
 	reader.error		= 0;
 	reader.cursor 		= 0;
 	reader.peek_cursor	= 0;
@@ -422,11 +503,12 @@ int			validation_ret, shall_have_plt;
 		return NULL;
 	}
 
-	read_start_chunk(&chunk, &reader, &shall_have_plt, width, height);
-	if(reader.error) {
-		if(error) *error = reader.error;
-		return NULL;
-	}
+	if(reader.type == LIBIMAGE_TYPE_PNG) libimage_process_png(&reader, &info);
+	else return NULL;
+
+
+	if(width) 	*width = info.width;
+	if(height)	*height = info.height;
 
 	return data; //For now
 }
